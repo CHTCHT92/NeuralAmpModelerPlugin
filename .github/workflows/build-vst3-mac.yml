@@ -10,10 +10,24 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-      - name: Check out repository
+      - name: Check out repository (without submodules)
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Fetch submodules (retries if GitLab is overloaded)
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            echo "Attempt $i"
+            git submodule sync --recursive
+            if git submodule update --init --recursive; then
+              echo "Submodules OK"
+              exit 0
+            fi
+            echo "Failed, waiting before retry..."
+            sleep 45
+          done
+          echo "Submodules could not be fetched after 12 attempts"
+          exit 1
+        shell: bash
 
       - name: Get VST3 SDK
         run: |
