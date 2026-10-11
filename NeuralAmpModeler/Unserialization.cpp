@@ -60,6 +60,8 @@ void NeuralAmpModeler::_UnserializeApplyConfig(nlohmann::json& config)
   if (mNAMPath.GetLength())
   {
     _StageModel(mNAMPath);
+    // The folder of the saved model becomes the Model list again (no host notification while restoring state)
+    _SetModelFolderFromFile(mNAMPath, false);
   }
   if (mIRPath.GetLength())
   {

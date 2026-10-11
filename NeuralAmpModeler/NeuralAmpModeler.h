@@ -1,5 +1,12 @@
 #pragma once
 
+#include <atomic>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
 #include "../AudioDSPTools/dsp/ImpulseResponse.h"
 #include "../AudioDSPTools/dsp/NoiseGate.h"
 #include "../AudioDSPTools/dsp/dsp.h"
@@ -47,8 +54,13 @@ enum EParams
   kInputCalibrationLevel,
   kOutputMode,
   kSlim,
+  // Automatable "model list" parameter: picks the n-th .nam file of the current folder.
+  kModelIndex,
   kNumParams
 };
+
+// Number of steps of the Model parameter (maximum number of .nam files listed from a folder).
+const int kMaxModels = 32;
 
 const int numKnobs = 6;
 
@@ -257,6 +269,17 @@ private:
   void _SetOutputGain();
   void _ApplySlimParamToLoadedNAMs();
 
+  // --- Model list: folder of .nam files driven by the automatable kModelIndex parameter ---
+  // Scans a folder for .nam files (sorted by name, max kMaxModels) and stores the list.
+  void _ScanModelFolder(const std::filesystem::path& folder);
+  // Uses the folder of the given .nam file as the model list, and positions the Model parameter on that file.
+  // notifyHost = false when called while the host is restoring state.
+  void _SetModelFolderFromFile(const WDL_String& filePath, bool notifyHost);
+  // Background thread: loads the wanted model off the audio thread.
+  void _ModelWorkerLoop();
+  // Loads a .nam file and puts it in the staging area. Returns an empty string on success.
+  std::string _StageModelInBackground(const std::filesystem::path& path);
+
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
   // 0.7.9 and later
@@ -324,4 +347,14 @@ private:
   std::unordered_map<std::string, double> mNAMParams = {{"Input", 0.0}, {"Output", 0.0}};
 
   NAMSender mInputSender, mOutputSender;
+
+  // Model list state
+  std::vector<std::filesystem::path> mModelFiles;
+  std::vector<std::string> mModelNames;
+  mutable std::mutex mModelListMutex; // protects mModelFiles, mModelNames and mNAMPath writes from the worker
+  std::atomic<int> mWantedModelIndex{-1};
+  std::atomic<int> mLoadedModelIndex{-1};
+  std::atomic<bool> mModelWorkerQuit{false};
+  std::atomic<bool> mModelPathNeedsUIRefresh{false};
+  std::thread mModelWorker;
 };

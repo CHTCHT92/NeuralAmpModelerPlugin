@@ -1,4 +1,7 @@
 #include <algorithm> // std::clamp, std::min
+#include <chrono>
+#include <cctype>
+#include <system_error>
 #include <cmath> // pow
 #include <filesystem>
 #include <iostream>
@@ -94,6 +97,19 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
   GetParam(kInputCalibrationLevel)
     ->InitDouble(kInputCalibrationLevelParamName.c_str(), kDefaultInputCalibrationLevel, -60.0, 60.0, 0.1, "dBu");
   GetParam(kSlim)->InitDouble("Slim", 0.0, 0.0, 1.0, 0.01);
+  // Model list parameter: kMaxModels steps, displayed as the file name of the selected .nam
+  GetParam(kModelIndex)->InitEnum("Model", 0, kMaxModels);
+  GetParam(kModelIndex)->SetDisplayFunc([this](double value, WDL_String& str) {
+    std::lock_guard<std::mutex> lock(mModelListMutex);
+    if (mModelNames.empty())
+    {
+      str.Set("-");
+      return;
+    }
+    const int last = static_cast<int>(mModelNames.size()) - 1;
+    const int idx = std::clamp(static_cast<int>(std::lround(value)), 0, last);
+    str.Set(mModelNames[static_cast<size_t>(idx)].c_str());
+  });
 
   mNoiseGateTrigger.AddListener(&mNoiseGateGain);
 
@@ -188,6 +204,11 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
         // Sets mNAMPath and mStagedNAM
         const std::string msg = _StageModel(fileName);
         // TODO error messages like the IR loader.
+        if (msg.empty())
+        {
+          // The folder of the picked file becomes the list driven by the Model parameter
+          _SetModelFolderFromFile(fileName, true);
+        }
         if (msg.size())
         {
           std::stringstream ss;
@@ -312,10 +333,15 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     // pGraphics->GetControlWithTag(kCtrlTagOutNorm)->SetMouseEventsWhenDisabled(false);
     // pGraphics->GetControlWithTag(kCtrlTagCalibrateInput)->SetMouseEventsWhenDisabled(false);
   };
+
+  mModelWorker = std::thread([this]() { _ModelWorkerLoop(); });
 }
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
+  mModelWorkerQuit = true;
+  if (mModelWorker.joinable())
+    mModelWorker.join();
   _DeallocateIOPointers();
 }
 
@@ -420,6 +446,20 @@ void NeuralAmpModeler::OnIdle()
   mInputSender.TransmitData(*this);
   mOutputSender.TransmitData(*this);
 
+  if (mModelPathNeedsUIRefresh.exchange(false))
+  {
+    if (GetUI())
+    {
+      WDL_String path;
+      {
+        std::lock_guard<std::mutex> lock(mModelListMutex);
+        path = mNAMPath;
+      }
+      if (path.GetLength())
+        SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, path.GetLength(), path.Get());
+    }
+  }
+
   if (mNewModelLoadedInDSP)
   {
     if (auto* pGraphics = GetUI())
@@ -457,7 +497,10 @@ bool NeuralAmpModeler::SerializeState(IByteChunk& chunk) const
   chunk.PutStr(version.Get());
   // Model directory (don't serialize the model itself; we'll just load it again
   // when we unserialize)
-  chunk.PutStr(mNAMPath.Get());
+  {
+    std::lock_guard<std::mutex> lock(mModelListMutex);
+    chunk.PutStr(mNAMPath.Get());
+  }
   chunk.PutStr(mIRPath.Get());
   return SerializeParams(chunk);
 }
@@ -522,6 +565,8 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kToneMid: mToneStack->SetParam("middle", GetParam(paramIdx)->Value()); break;
     case kToneTreble: mToneStack->SetParam("treble", GetParam(paramIdx)->Value()); break;
     case kSlim: _ApplySlimParamToLoadedNAMs(); break;
+    // Only records the wish; the background thread does the actual (slow) loading.
+    case kModelIndex: mWantedModelIndex.store(GetParam(kModelIndex)->Int()); break;
     default: break;
   }
 }
@@ -782,6 +827,158 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
     mNAMPath = previousNAMPath;
     std::cerr << "Failed to read DSP module" << std::endl;
     std::cerr << e.what() << std::endl;
+    return e.what();
+  }
+  return "";
+}
+
+void NeuralAmpModeler::_ScanModelFolder(const std::filesystem::path& folder)
+{
+  std::vector<std::filesystem::path> files;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
+  {
+    std::error_code ec2;
+    if (!it->is_regular_file(ec2))
+      continue;
+    const std::string fileName = it->path().filename().string();
+    if (fileName.empty() || fileName[0] == '.') // skips hidden files, e.g. macOS "._xxx.nam"
+      continue;
+    std::string ext = it->path().extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) { return std::tolower(ch); });
+    if (ext == ".nam")
+      files.push_back(it->path());
+  }
+
+  auto lowerName = [](const std::filesystem::path& p) {
+    std::string s = p.filename().string();
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) { return std::tolower(ch); });
+    return s;
+  };
+  std::sort(files.begin(), files.end(),
+            [&](const std::filesystem::path& a, const std::filesystem::path& b) { return lowerName(a) < lowerName(b); });
+  if (files.size() > static_cast<size_t>(kMaxModels))
+    files.resize(static_cast<size_t>(kMaxModels));
+
+  std::vector<std::string> names;
+  names.reserve(files.size());
+  for (const auto& f : files)
+    names.push_back(f.stem().string());
+
+  std::lock_guard<std::mutex> lock(mModelListMutex);
+  mModelFiles = std::move(files);
+  mModelNames = std::move(names);
+}
+
+void NeuralAmpModeler::_SetModelFolderFromFile(const WDL_String& filePath, bool notifyHost)
+{
+  const std::filesystem::path file = std::filesystem::u8path(filePath.Get());
+  _ScanModelFolder(file.parent_path());
+
+  int index = -1;
+  {
+    std::lock_guard<std::mutex> lock(mModelListMutex);
+    for (size_t i = 0; i < mModelFiles.size(); i++)
+    {
+      if (mModelFiles[i].filename() == file.filename())
+      {
+        index = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+  if (index < 0)
+    return; // The file isn't among the first kMaxModels files of its folder
+
+  // The file is already being loaded by the caller: don't let the worker load it again.
+  mLoadedModelIndex.store(index);
+  mWantedModelIndex.store(index);
+  GetParam(kModelIndex)->Set(index);
+
+  if (notifyHost)
+  {
+    // The file names changed, and so did the position of the parameter.
+    InformHostOfParameterDetailsChange();
+    const double normalized = GetParam(kModelIndex)->ToNormalized(index);
+    BeginInformHostOfParamChangeFromUI(kModelIndex);
+    SendParameterValueFromUI(kModelIndex, normalized);
+    EndInformHostOfParamChangeFromUI(kModelIndex);
+  }
+}
+
+void NeuralAmpModeler::_ModelWorkerLoop()
+{
+  int lastSeen = -1;
+  int stableCount = 0;
+  while (!mModelWorkerQuit.load())
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    const int wanted = mWantedModelIndex.load();
+    if (wanted < 0)
+      continue;
+
+    std::filesystem::path file;
+    int effective = -1;
+    {
+      std::lock_guard<std::mutex> lock(mModelListMutex);
+      if (!mModelFiles.empty())
+      {
+        // Steps beyond the last file simply stay on the last file.
+        effective = std::min(wanted, static_cast<int>(mModelFiles.size()) - 1);
+        file = mModelFiles[static_cast<size_t>(effective)];
+      }
+    }
+    if (effective < 0 || effective == mLoadedModelIndex.load())
+    {
+      lastSeen = effective;
+      stableCount = 0;
+      continue;
+    }
+
+    // Debounce: only load once the slider has stopped moving for ~100 ms.
+    if (effective != lastSeen)
+    {
+      lastSeen = effective;
+      stableCount = 0;
+      continue;
+    }
+    if (++stableCount < 3)
+      continue;
+
+    const std::string msg = _StageModelInBackground(file);
+    if (msg.size())
+      std::cerr << "Failed to load model " << file.string() << ": " << msg << std::endl;
+    // Even on failure, so that we don't retry in a loop.
+    mLoadedModelIndex.store(effective);
+    stableCount = 0;
+  }
+}
+
+std::string NeuralAmpModeler::_StageModelInBackground(const std::filesystem::path& path)
+{
+  try
+  {
+    std::unique_ptr<nam::DSP> model = nam::get_dsp(path);
+    if (model->NumInputChannels() != 1)
+      throw std::runtime_error("Model must have 1 input channel, but has " + std::to_string(model->NumInputChannels()));
+    if (model->NumOutputChannels() != 1)
+      throw std::runtime_error("Model must have 1 output channel, but has "
+                               + std::to_string(model->NumOutputChannels()));
+
+    std::unique_ptr<ResamplingNAM> temp = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
+    temp->Reset(GetSampleRate(), GetBlockSize());
+    if (nam::SlimmableModel* slimmable = temp->GetSlimmableModel())
+      slimmable->SetSlimmableSize(GetParam(kSlim)->Value());
+    mStagedModel = std::move(temp);
+    {
+      std::lock_guard<std::mutex> lock(mModelListMutex);
+      mNAMPath.Set(path.string().c_str());
+    }
+    mModelPathNeedsUIRefresh = true; // the UI thread will update the file browser label
+  }
+  catch (std::exception& e)
+  {
     return e.what();
   }
   return "";
