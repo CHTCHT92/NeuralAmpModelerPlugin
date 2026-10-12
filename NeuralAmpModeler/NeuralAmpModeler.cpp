@@ -1,6 +1,7 @@
 #include <algorithm> // std::clamp, std::min
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <system_error>
 #include <cmath> // pow
 #include <filesystem>
@@ -122,6 +123,31 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     const int last = static_cast<int>(mIRNames.size()) - 1;
     const int idx = std::clamp(static_cast<int>(std::lround(value)), 0, last);
     str.Set(mIRNames[static_cast<size_t>(idx)].c_str());
+  });
+  // Bank parameters: kMaxBanks steps, displayed as the name of the selected folder
+  GetParam(kBankIndex)->InitEnum("Bank", 0, kMaxBanks);
+  GetParam(kBankIndex)->SetDisplayFunc([this](double value, WDL_String& str) {
+    std::lock_guard<std::mutex> lock(mModelListMutex);
+    if (mBankNames.empty())
+    {
+      str.Set("-");
+      return;
+    }
+    const int last = static_cast<int>(mBankNames.size()) - 1;
+    const int idx = std::clamp(static_cast<int>(std::lround(value)), 0, last);
+    str.Set(mBankNames[static_cast<size_t>(idx)].c_str());
+  });
+  GetParam(kIRBankIndex)->InitEnum("Cab Bank", 0, kMaxBanks);
+  GetParam(kIRBankIndex)->SetDisplayFunc([this](double value, WDL_String& str) {
+    std::lock_guard<std::mutex> lock(mIRListMutex);
+    if (mIRBankNames.empty())
+    {
+      str.Set("-");
+      return;
+    }
+    const int last = static_cast<int>(mIRBankNames.size()) - 1;
+    const int idx = std::clamp(static_cast<int>(std::lround(value)), 0, last);
+    str.Set(mIRBankNames[static_cast<size_t>(idx)].c_str());
   });
 
   mNoiseGateTrigger.AddListener(&mNoiseGateGain);
@@ -607,12 +633,29 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     // Only records the wish; the background thread does the actual (slow) loading.
     case kModelIndex: mWantedModelIndex.store(GetParam(kModelIndex)->Int()); break;
     case kIRIndex: mWantedIRIndex.store(GetParam(kIRIndex)->Int()); break;
+    case kBankIndex: mWantedBankIndex.store(GetParam(kBankIndex)->Int()); break;
+    case kIRBankIndex: mWantedIRBankIndex.store(GetParam(kIRBankIndex)->Int()); break;
     default: break;
   }
 }
 
 void NeuralAmpModeler::OnParamChangeUI(int paramIdx, EParamSource source)
 {
+  // A new Bank value means the Model / Cab list comes from another folder: swap the list, then tell the host
+  // that the displayed file names changed.
+  if (paramIdx == kBankIndex)
+  {
+    if (_ApplyModelBank(GetParam(kBankIndex)->Int()))
+      InformHostOfParameterDetailsChange();
+    return;
+  }
+  if (paramIdx == kIRBankIndex)
+  {
+    if (_ApplyIRBank(GetParam(kIRBankIndex)->Int()))
+      InformHostOfParameterDetailsChange();
+    return;
+  }
+
   if (auto pGraphics = GetUI())
   {
     bool active = GetParam(paramIdx)->Bool();
@@ -872,6 +915,190 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   return "";
 }
 
+// Lists the "banks" around a folder: the sibling folders (same parent) that hold at least one file with the given
+// extension. The current folder is always part of the list. When the parent is the user's home folder, the banks are
+// not searched (that would walk through Documents, Desktop, ... and trigger macOS privacy prompts).
+static void ListBankFolders(const std::filesystem::path& currentFolder, const std::string& extension, size_t maxCount,
+                            std::vector<std::filesystem::path>& folders, std::vector<std::string>& names)
+{
+  folders.clear();
+  names.clear();
+  const std::filesystem::path root = currentFolder.parent_path();
+
+  auto isHomeFolder = [&]() {
+    for (const char* var : {"HOME", "USERPROFILE"})
+    {
+      const char* home = std::getenv(var);
+      if (home != nullptr && *home != '\0')
+      {
+        std::error_code ec;
+        const bool same = std::filesystem::equivalent(root, std::filesystem::path(home), ec);
+        if (!ec && same)
+          return true;
+      }
+    }
+    return false;
+  };
+  auto hasFileWithExtension = [&](const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+    {
+      std::error_code ec2;
+      if (!it->is_regular_file(ec2))
+        continue;
+      const std::string fileName = it->path().filename().string();
+      if (fileName.empty() || fileName[0] == '.')
+        continue;
+      std::string ext = it->path().extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) { return std::tolower(ch); });
+      if (ext == extension)
+        return true;
+    }
+    return false;
+  };
+
+  std::vector<std::filesystem::path> found;
+  if (root.empty() || isHomeFolder())
+  {
+    found.push_back(currentFolder);
+  }
+  else
+  {
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
+    {
+      std::error_code ec2;
+      if (!it->is_directory(ec2))
+        continue;
+      const std::string dirName = it->path().filename().string();
+      if (dirName.empty() || dirName[0] == '.')
+        continue;
+      if (it->path().filename() == currentFolder.filename() || hasFileWithExtension(it->path()))
+        found.push_back(it->path());
+    }
+  }
+
+  auto lowerName = [](const std::filesystem::path& p) {
+    std::string s = p.filename().string();
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) { return std::tolower(ch); });
+    return s;
+  };
+  std::sort(found.begin(), found.end(),
+            [&](const std::filesystem::path& a, const std::filesystem::path& b) { return lowerName(a) < lowerName(b); });
+
+  if (found.size() > maxCount)
+  {
+    // Too many folders: keep the first ones, but never lose the current folder.
+    const auto current = std::find_if(found.begin(), found.end(), [&](const std::filesystem::path& p) {
+      return p.filename() == currentFolder.filename();
+    });
+    const bool currentIsKept = current != found.end() && static_cast<size_t>(current - found.begin()) < maxCount;
+    const std::filesystem::path currentPath = current != found.end() ? *current : currentFolder;
+    found.resize(maxCount);
+    if (!currentIsKept)
+      found.back() = currentPath;
+  }
+
+  for (const auto& p : found)
+  {
+    folders.push_back(p);
+    names.push_back(p.filename().string());
+  }
+}
+
+void NeuralAmpModeler::_RefreshModelBanks(const std::filesystem::path& currentFolder)
+{
+  std::vector<std::filesystem::path> folders;
+  std::vector<std::string> names;
+  ListBankFolders(currentFolder, ".nam", static_cast<size_t>(kMaxBanks), folders, names);
+
+  int bankIndex = -1;
+  for (size_t i = 0; i < folders.size(); i++)
+  {
+    if (folders[i].filename() == currentFolder.filename())
+    {
+      bankIndex = static_cast<int>(i);
+      break;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(mModelListMutex);
+    mBankFolders = std::move(folders);
+    mBankNames = std::move(names);
+  }
+  if (bankIndex >= 0)
+  {
+    mCurrentBankIndex.store(bankIndex);
+    mWantedBankIndex.store(bankIndex);
+    GetParam(kBankIndex)->Set(bankIndex);
+  }
+}
+
+void NeuralAmpModeler::_RefreshIRBanks(const std::filesystem::path& currentFolder)
+{
+  std::vector<std::filesystem::path> folders;
+  std::vector<std::string> names;
+  ListBankFolders(currentFolder, ".wav", static_cast<size_t>(kMaxBanks), folders, names);
+
+  int bankIndex = -1;
+  for (size_t i = 0; i < folders.size(); i++)
+  {
+    if (folders[i].filename() == currentFolder.filename())
+    {
+      bankIndex = static_cast<int>(i);
+      break;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(mIRListMutex);
+    mIRBankFolders = std::move(folders);
+    mIRBankNames = std::move(names);
+  }
+  if (bankIndex >= 0)
+  {
+    mCurrentIRBankIndex.store(bankIndex);
+    mWantedIRBankIndex.store(bankIndex);
+    GetParam(kIRBankIndex)->Set(bankIndex);
+  }
+}
+
+bool NeuralAmpModeler::_ApplyModelBank(int idx)
+{
+  std::filesystem::path folder;
+  {
+    std::lock_guard<std::mutex> lock(mModelListMutex);
+    if (mBankFolders.empty())
+      return false;
+    idx = std::clamp(idx, 0, static_cast<int>(mBankFolders.size()) - 1);
+    if (idx == mCurrentBankIndex.load())
+      return false;
+    folder = mBankFolders[static_cast<size_t>(idx)];
+  }
+  _ScanModelFolder(folder);
+  mCurrentBankIndex.store(idx);
+  // Forces the worker to load the file at the current Model position, in the new folder.
+  mLoadedModelIndex.store(-1);
+  return true;
+}
+
+bool NeuralAmpModeler::_ApplyIRBank(int idx)
+{
+  std::filesystem::path folder;
+  {
+    std::lock_guard<std::mutex> lock(mIRListMutex);
+    if (mIRBankFolders.empty())
+      return false;
+    idx = std::clamp(idx, 0, static_cast<int>(mIRBankFolders.size()) - 1);
+    if (idx == mCurrentIRBankIndex.load())
+      return false;
+    folder = mIRBankFolders[static_cast<size_t>(idx)];
+  }
+  _ScanIRFolder(folder);
+  mCurrentIRBankIndex.store(idx);
+  mLoadedIRIndex.store(-1);
+  return true;
+}
+
 void NeuralAmpModeler::_ScanModelFolder(const std::filesystem::path& folder)
 {
   std::vector<std::filesystem::path> files;
@@ -914,6 +1141,7 @@ void NeuralAmpModeler::_SetModelFolderFromFile(const WDL_String& filePath, bool 
 {
   const std::filesystem::path file = std::filesystem::u8path(filePath.Get());
   _ScanModelFolder(file.parent_path());
+  _RefreshModelBanks(file.parent_path());
 
   int index = -1;
   {
@@ -943,6 +1171,10 @@ void NeuralAmpModeler::_SetModelFolderFromFile(const WDL_String& filePath, bool 
     BeginInformHostOfParamChangeFromUI(kModelIndex);
     SendParameterValueFromUI(kModelIndex, normalized);
     EndInformHostOfParamChangeFromUI(kModelIndex);
+    const double bankNormalized = GetParam(kBankIndex)->ToNormalized(GetParam(kBankIndex)->Int());
+    BeginInformHostOfParamChangeFromUI(kBankIndex);
+    SendParameterValueFromUI(kBankIndex, bankNormalized);
+    EndInformHostOfParamChangeFromUI(kBankIndex);
   }
 }
 
@@ -953,6 +1185,11 @@ void NeuralAmpModeler::_ModelWorkerLoop()
   while (!mModelWorkerQuit.load())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    // A Bank change that arrived through the audio thread (the main-thread path normally handles it already)
+    const int wantedBank = mWantedBankIndex.load();
+    if (wantedBank >= 0 && wantedBank != mCurrentBankIndex.load())
+      _ApplyModelBank(wantedBank);
 
     const int wanted = mWantedModelIndex.load();
     if (wanted < 0)
@@ -1066,6 +1303,7 @@ void NeuralAmpModeler::_SetIRFolderFromFile(const WDL_String& filePath, bool not
 {
   const std::filesystem::path file = std::filesystem::u8path(filePath.Get());
   _ScanIRFolder(file.parent_path());
+  _RefreshIRBanks(file.parent_path());
 
   int index = -1;
   {
@@ -1094,6 +1332,10 @@ void NeuralAmpModeler::_SetIRFolderFromFile(const WDL_String& filePath, bool not
     BeginInformHostOfParamChangeFromUI(kIRIndex);
     SendParameterValueFromUI(kIRIndex, normalized);
     EndInformHostOfParamChangeFromUI(kIRIndex);
+    const double bankNormalized = GetParam(kIRBankIndex)->ToNormalized(GetParam(kIRBankIndex)->Int());
+    BeginInformHostOfParamChangeFromUI(kIRBankIndex);
+    SendParameterValueFromUI(kIRBankIndex, bankNormalized);
+    EndInformHostOfParamChangeFromUI(kIRBankIndex);
   }
 }
 
@@ -1104,6 +1346,10 @@ void NeuralAmpModeler::_IRWorkerLoop()
   while (!mIRWorkerQuit.load())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    const int wantedBank = mWantedIRBankIndex.load();
+    if (wantedBank >= 0 && wantedBank != mCurrentIRBankIndex.load())
+      _ApplyIRBank(wantedBank);
 
     const int wanted = mWantedIRIndex.load();
     if (wanted < 0)

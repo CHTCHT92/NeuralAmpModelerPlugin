@@ -59,6 +59,9 @@ enum EParams
   kModelIndex,
   // Automatable "cab list" parameter: picks the n-th .wav IR file of the current IR folder.
   kIRIndex,
+  // Automatable "bank" parameters: pick which folder (among the sibling folders) the Model / Cab lists come from.
+  kBankIndex,
+  kIRBankIndex,
   kNumParams
 };
 
@@ -66,6 +69,8 @@ enum EParams
 const int kMaxModels = 32;
 // Number of steps of the Cab parameter (maximum number of IR files listed from a folder).
 const int kMaxIRs = 16;
+// Number of steps of the Bank / Cab Bank parameters (maximum number of folders listed).
+const int kMaxBanks = 16;
 
 const int numKnobs = 6;
 
@@ -292,6 +297,14 @@ private:
   // Loads an IR file and puts it in the staging area. Returns an empty string on success.
   std::string _StageIRInBackground(const std::filesystem::path& path);
 
+  // --- Banks: the sibling folders of the current model / IR folder, selectable with kBankIndex / kIRBankIndex ---
+  // Rebuilds the bank list around the given (current) folder and positions the Bank parameter on it.
+  void _RefreshModelBanks(const std::filesystem::path& currentFolder);
+  void _RefreshIRBanks(const std::filesystem::path& currentFolder);
+  // Switches the model / IR list to the idx-th bank folder. Returns true if the list changed.
+  bool _ApplyModelBank(int idx);
+  bool _ApplyIRBank(int idx);
+
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
   // 0.7.9 and later
@@ -379,4 +392,14 @@ private:
   std::atomic<bool> mIRWorkerQuit{false};
   std::atomic<bool> mIRPathNeedsUIRefresh{false};
   std::thread mIRWorker;
+
+  // Bank state (model banks protected by mModelListMutex, IR banks by mIRListMutex)
+  std::vector<std::filesystem::path> mBankFolders;
+  std::vector<std::string> mBankNames;
+  std::atomic<int> mCurrentBankIndex{-1};
+  std::atomic<int> mWantedBankIndex{-1};
+  std::vector<std::filesystem::path> mIRBankFolders;
+  std::vector<std::string> mIRBankNames;
+  std::atomic<int> mCurrentIRBankIndex{-1};
+  std::atomic<int> mWantedIRBankIndex{-1};
 };
