@@ -66,6 +66,8 @@ void NeuralAmpModeler::_UnserializeApplyConfig(nlohmann::json& config)
   if (mIRPath.GetLength())
   {
     _StageIR(mIRPath);
+    // The folder of the saved IR becomes the Cab list again (no host notification while restoring state)
+    _SetIRFolderFromFile(mIRPath, false);
   }
 }
 

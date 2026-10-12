@@ -110,6 +110,19 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     const int idx = std::clamp(static_cast<int>(std::lround(value)), 0, last);
     str.Set(mModelNames[static_cast<size_t>(idx)].c_str());
   });
+  // Cab list parameter: kMaxIRs steps, displayed as the file name of the selected IR
+  GetParam(kIRIndex)->InitEnum("Cab", 0, kMaxIRs);
+  GetParam(kIRIndex)->SetDisplayFunc([this](double value, WDL_String& str) {
+    std::lock_guard<std::mutex> lock(mIRListMutex);
+    if (mIRNames.empty())
+    {
+      str.Set("-");
+      return;
+    }
+    const int last = static_cast<int>(mIRNames.size()) - 1;
+    const int idx = std::clamp(static_cast<int>(std::lround(value)), 0, last);
+    str.Set(mIRNames[static_cast<size_t>(idx)].c_str());
+  });
 
   mNoiseGateTrigger.AddListener(&mNoiseGateGain);
 
@@ -233,6 +246,11 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 
           _ShowMessageBox(GetUI(), message.str().c_str(), "Failed to load IR!", kMB_OK);
         }
+        else
+        {
+          // The folder of the picked IR becomes the list driven by the Cab parameter
+          _SetIRFolderFromFile(fileName, true);
+        }
       }
     };
 
@@ -335,13 +353,17 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
   };
 
   mModelWorker = std::thread([this]() { _ModelWorkerLoop(); });
+  mIRWorker = std::thread([this]() { _IRWorkerLoop(); });
 }
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
   mModelWorkerQuit = true;
+  mIRWorkerQuit = true;
   if (mModelWorker.joinable())
     mModelWorker.join();
+  if (mIRWorker.joinable())
+    mIRWorker.join();
   _DeallocateIOPointers();
 }
 
@@ -460,6 +482,20 @@ void NeuralAmpModeler::OnIdle()
     }
   }
 
+  if (mIRPathNeedsUIRefresh.exchange(false))
+  {
+    if (GetUI())
+    {
+      WDL_String path;
+      {
+        std::lock_guard<std::mutex> lock(mIRListMutex);
+        path = mIRPath;
+      }
+      if (path.GetLength())
+        SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, path.GetLength(), path.Get());
+    }
+  }
+
   if (mNewModelLoadedInDSP)
   {
     if (auto* pGraphics = GetUI())
@@ -501,7 +537,10 @@ bool NeuralAmpModeler::SerializeState(IByteChunk& chunk) const
     std::lock_guard<std::mutex> lock(mModelListMutex);
     chunk.PutStr(mNAMPath.Get());
   }
-  chunk.PutStr(mIRPath.Get());
+  {
+    std::lock_guard<std::mutex> lock(mIRListMutex);
+    chunk.PutStr(mIRPath.Get());
+  }
   return SerializeParams(chunk);
 }
 
@@ -567,6 +606,7 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kSlim: _ApplySlimParamToLoadedNAMs(); break;
     // Only records the wish; the background thread does the actual (slow) loading.
     case kModelIndex: mWantedModelIndex.store(GetParam(kModelIndex)->Int()); break;
+    case kIRIndex: mWantedIRIndex.store(GetParam(kIRIndex)->Int()); break;
     default: break;
   }
 }
@@ -718,7 +758,7 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     if (irSampleRate != sampleRate)
     {
       const auto irData = mStagedIR->GetData();
-      mStagedIR = std::make_unique<dsp::ImpulseResponse>(irData, sampleRate);
+      mStagedIR = std::make_unique<LongImpulseResponse>(irData, sampleRate);
     }
   }
   else if (mIR != nullptr)
@@ -727,7 +767,7 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
     if (irSampleRate != sampleRate)
     {
       const auto irData = mIR->GetData();
-      mStagedIR = std::make_unique<dsp::ImpulseResponse>(irData, sampleRate);
+      mStagedIR = std::make_unique<LongImpulseResponse>(irData, sampleRate);
     }
   }
 }
@@ -984,6 +1024,150 @@ std::string NeuralAmpModeler::_StageModelInBackground(const std::filesystem::pat
   return "";
 }
 
+void NeuralAmpModeler::_ScanIRFolder(const std::filesystem::path& folder)
+{
+  std::vector<std::filesystem::path> files;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
+  {
+    std::error_code ec2;
+    if (!it->is_regular_file(ec2))
+      continue;
+    const std::string fileName = it->path().filename().string();
+    if (fileName.empty() || fileName[0] == '.') // skips hidden files, e.g. macOS "._xxx.wav"
+      continue;
+    std::string ext = it->path().extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) { return std::tolower(ch); });
+    if (ext == ".wav")
+      files.push_back(it->path());
+  }
+
+  auto lowerName = [](const std::filesystem::path& p) {
+    std::string s = p.filename().string();
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) { return std::tolower(ch); });
+    return s;
+  };
+  std::sort(files.begin(), files.end(),
+            [&](const std::filesystem::path& a, const std::filesystem::path& b) { return lowerName(a) < lowerName(b); });
+  if (files.size() > static_cast<size_t>(kMaxIRs))
+    files.resize(static_cast<size_t>(kMaxIRs));
+
+  std::vector<std::string> names;
+  names.reserve(files.size());
+  for (const auto& f : files)
+    names.push_back(f.stem().string());
+
+  std::lock_guard<std::mutex> lock(mIRListMutex);
+  mIRFiles = std::move(files);
+  mIRNames = std::move(names);
+}
+
+void NeuralAmpModeler::_SetIRFolderFromFile(const WDL_String& filePath, bool notifyHost)
+{
+  const std::filesystem::path file = std::filesystem::u8path(filePath.Get());
+  _ScanIRFolder(file.parent_path());
+
+  int index = -1;
+  {
+    std::lock_guard<std::mutex> lock(mIRListMutex);
+    for (size_t i = 0; i < mIRFiles.size(); i++)
+    {
+      if (mIRFiles[i].filename() == file.filename())
+      {
+        index = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+  if (index < 0)
+    return; // The file isn't among the first kMaxIRs files of its folder
+
+  // The file is already being loaded by the caller: don't let the worker load it again.
+  mLoadedIRIndex.store(index);
+  mWantedIRIndex.store(index);
+  GetParam(kIRIndex)->Set(index);
+
+  if (notifyHost)
+  {
+    InformHostOfParameterDetailsChange();
+    const double normalized = GetParam(kIRIndex)->ToNormalized(index);
+    BeginInformHostOfParamChangeFromUI(kIRIndex);
+    SendParameterValueFromUI(kIRIndex, normalized);
+    EndInformHostOfParamChangeFromUI(kIRIndex);
+  }
+}
+
+void NeuralAmpModeler::_IRWorkerLoop()
+{
+  int lastSeen = -1;
+  int stableCount = 0;
+  while (!mIRWorkerQuit.load())
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    const int wanted = mWantedIRIndex.load();
+    if (wanted < 0)
+      continue;
+
+    std::filesystem::path file;
+    int effective = -1;
+    {
+      std::lock_guard<std::mutex> lock(mIRListMutex);
+      if (!mIRFiles.empty())
+      {
+        // Steps beyond the last file simply stay on the last file.
+        effective = std::min(wanted, static_cast<int>(mIRFiles.size()) - 1);
+        file = mIRFiles[static_cast<size_t>(effective)];
+      }
+    }
+    if (effective < 0 || effective == mLoadedIRIndex.load())
+    {
+      lastSeen = effective;
+      stableCount = 0;
+      continue;
+    }
+
+    // Debounce: only load once the slider has stopped moving for ~100 ms.
+    if (effective != lastSeen)
+    {
+      lastSeen = effective;
+      stableCount = 0;
+      continue;
+    }
+    if (++stableCount < 3)
+      continue;
+
+    const std::string msg = _StageIRInBackground(file);
+    if (msg.size())
+      std::cerr << "Failed to load IR " << file.string() << ": " << msg << std::endl;
+    // Even on failure, so that we don't retry in a loop.
+    mLoadedIRIndex.store(effective);
+    stableCount = 0;
+  }
+}
+
+std::string NeuralAmpModeler::_StageIRInBackground(const std::filesystem::path& path)
+{
+  try
+  {
+    std::unique_ptr<LongImpulseResponse> temp = std::make_unique<LongImpulseResponse>(path.string().c_str(), GetSampleRate());
+    const dsp::wav::LoadReturnCode wavState = temp->GetWavState();
+    if (wavState != dsp::wav::LoadReturnCode::SUCCESS)
+      return dsp::wav::GetMsgForLoadReturnCode(wavState);
+    mStagedIR = std::move(temp);
+    {
+      std::lock_guard<std::mutex> lock(mIRListMutex);
+      mIRPath.Set(path.string().c_str());
+    }
+    mIRPathNeedsUIRefresh = true; // the UI thread will update the file browser label
+  }
+  catch (std::exception& e)
+  {
+    return e.what();
+  }
+  return "";
+}
+
 dsp::wav::LoadReturnCode NeuralAmpModeler::_StageIR(const WDL_String& irPath)
 {
   // FIXME it'd be better for the path to be "staged" as well. Just in case the
@@ -993,7 +1177,7 @@ dsp::wav::LoadReturnCode NeuralAmpModeler::_StageIR(const WDL_String& irPath)
   dsp::wav::LoadReturnCode wavState = dsp::wav::LoadReturnCode::ERROR_OTHER;
   try
   {
-    mStagedIR = std::make_unique<dsp::ImpulseResponse>(irPath.Get(), sampleRate);
+    mStagedIR = std::make_unique<LongImpulseResponse>(irPath.Get(), sampleRate);
     wavState = mStagedIR->GetWavState();
   }
   catch (std::runtime_error& e)

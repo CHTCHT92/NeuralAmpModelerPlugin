@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../AudioDSPTools/dsp/ImpulseResponse.h"
+#include "LongImpulseResponse.h"
 #include "../AudioDSPTools/dsp/NoiseGate.h"
 #include "../AudioDSPTools/dsp/dsp.h"
 #include "../AudioDSPTools/dsp/wav.h"
@@ -56,11 +57,15 @@ enum EParams
   kSlim,
   // Automatable "model list" parameter: picks the n-th .nam file of the current folder.
   kModelIndex,
+  // Automatable "cab list" parameter: picks the n-th .wav IR file of the current IR folder.
+  kIRIndex,
   kNumParams
 };
 
 // Number of steps of the Model parameter (maximum number of .nam files listed from a folder).
 const int kMaxModels = 32;
+// Number of steps of the Cab parameter (maximum number of IR files listed from a folder).
+const int kMaxIRs = 16;
 
 const int numKnobs = 6;
 
@@ -280,6 +285,13 @@ private:
   // Loads a .nam file and puts it in the staging area. Returns an empty string on success.
   std::string _StageModelInBackground(const std::filesystem::path& path);
 
+  // --- Cab list: same mechanism as the model list, for IR (.wav) files, driven by kIRIndex ---
+  void _ScanIRFolder(const std::filesystem::path& folder);
+  void _SetIRFolderFromFile(const WDL_String& filePath, bool notifyHost);
+  void _IRWorkerLoop();
+  // Loads an IR file and puts it in the staging area. Returns an empty string on success.
+  std::string _StageIRInBackground(const std::filesystem::path& path);
+
   // See: Unserialization.cpp
   void _UnserializeApplyConfig(nlohmann::json& config);
   // 0.7.9 and later
@@ -319,10 +331,10 @@ private:
   // The model actually being used:
   std::unique_ptr<ResamplingNAM> mModel;
   // And the IR
-  std::unique_ptr<dsp::ImpulseResponse> mIR;
+  std::unique_ptr<LongImpulseResponse> mIR;
   // Manages switching what DSP is being used.
   std::unique_ptr<ResamplingNAM> mStagedModel;
-  std::unique_ptr<dsp::ImpulseResponse> mStagedIR;
+  std::unique_ptr<LongImpulseResponse> mStagedIR;
   // Flags to take away the modules at a safe time.
   std::atomic<bool> mShouldRemoveModel = false;
   std::atomic<bool> mShouldRemoveIR = false;
@@ -357,4 +369,14 @@ private:
   std::atomic<bool> mModelWorkerQuit{false};
   std::atomic<bool> mModelPathNeedsUIRefresh{false};
   std::thread mModelWorker;
+
+  // Cab (IR) list state
+  std::vector<std::filesystem::path> mIRFiles;
+  std::vector<std::string> mIRNames;
+  mutable std::mutex mIRListMutex; // protects mIRFiles, mIRNames and mIRPath writes from the worker
+  std::atomic<int> mWantedIRIndex{-1};
+  std::atomic<int> mLoadedIRIndex{-1};
+  std::atomic<bool> mIRWorkerQuit{false};
+  std::atomic<bool> mIRPathNeedsUIRefresh{false};
+  std::thread mIRWorker;
 };
