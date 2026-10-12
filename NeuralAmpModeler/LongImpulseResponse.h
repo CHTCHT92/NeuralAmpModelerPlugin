@@ -14,6 +14,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <vector>
 
@@ -256,6 +259,165 @@ private:
 };
 } // namespace lir
 
+// Tolerant WAV reader (replaces dsp::wav::Load for IR files). Compared to the original loader it accepts:
+//  - any number of channels (mixed down to mono by averaging),
+//  - PCM 8/16/24/32 bits and float 32/64 bits,
+//  - WAVE_FORMAT_EXTENSIBLE with or without a "fact" chunk,
+//  - any extra chunks (properly skipping the pad byte of odd-sized chunks),
+//  - a "data" chunk whose declared size is larger than the file (streamed/truncated files).
+inline dsp::wav::LoadReturnCode LoadWavTolerant(const char* fileName, std::vector<float>& audio, double& sampleRate)
+{
+  using RC = dsp::wav::LoadReturnCode;
+  audio.clear();
+  std::ifstream f(std::filesystem::u8path(fileName), std::ios::binary);
+  if (!f.is_open())
+    return RC::ERROR_OPENING;
+  f.seekg(0, std::ios::end);
+  const std::streamoff fileSize = f.tellg();
+  f.seekg(0, std::ios::beg);
+
+  auto rd32 = [&](uint32_t& v) {
+    unsigned char b[4];
+    f.read(reinterpret_cast<char*>(b), 4);
+    v = static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) | (static_cast<uint32_t>(b[2]) << 16)
+        | (static_cast<uint32_t>(b[3]) << 24);
+    return static_cast<bool>(f);
+  };
+
+  char id[4];
+  uint32_t riffSize = 0;
+  f.read(id, 4);
+  if (!f || std::memcmp(id, "RIFF", 4) != 0)
+    return RC::ERROR_NOT_RIFF;
+  if (!rd32(riffSize))
+    return RC::ERROR_INVALID_FILE;
+  f.read(id, 4);
+  if (!f || std::memcmp(id, "WAVE", 4) != 0)
+    return RC::ERROR_NOT_WAVE;
+
+  bool haveFmt = false;
+  unsigned format = 0, channels = 0, bits = 0;
+  uint32_t rate = 0;
+  while (true)
+  {
+    char chunkId[4];
+    uint32_t chunkSize = 0;
+    f.read(chunkId, 4);
+    if (!f || !rd32(chunkSize))
+      break;
+
+    if (std::memcmp(chunkId, "fmt ", 4) == 0)
+    {
+      if (chunkSize < 16 || chunkSize > 4096)
+        return RC::ERROR_INVALID_FILE;
+      std::vector<unsigned char> b(chunkSize);
+      f.read(reinterpret_cast<char*>(b.data()), static_cast<std::streamsize>(chunkSize));
+      if (!f)
+        return RC::ERROR_INVALID_FILE;
+      format = b[0] | (b[1] << 8);
+      channels = b[2] | (b[3] << 8);
+      rate = static_cast<uint32_t>(b[4]) | (static_cast<uint32_t>(b[5]) << 8) | (static_cast<uint32_t>(b[6]) << 16)
+             | (static_cast<uint32_t>(b[7]) << 24);
+      bits = b[14] | (b[15] << 8);
+      if (format == 0xFFFE) // WAVE_FORMAT_EXTENSIBLE: the real format is the first 2 bytes of the sub-format GUID
+      {
+        if (chunkSize < 26)
+          return RC::ERROR_INVALID_FILE;
+        format = b[24] | (b[25] << 8);
+      }
+      haveFmt = true;
+      if (chunkSize & 1)
+        f.ignore(1);
+    }
+    else if (std::memcmp(chunkId, "data", 4) == 0)
+    {
+      if (!haveFmt)
+        return RC::ERROR_MISSING_FMT;
+      if (format == 6)
+        return RC::ERROR_UNSUPPORTED_FORMAT_ALAW;
+      if (format == 7)
+        return RC::ERROR_UNSUPPORTED_FORMAT_MULAW;
+      const bool isPCM = (format == 1);
+      const bool isFloat = (format == 3);
+      if (!isPCM && !isFloat)
+        return RC::ERROR_UNSUPPORTED_FORMAT_OTHER;
+      if (isPCM && bits != 8 && bits != 16 && bits != 24 && bits != 32)
+        return RC::ERROR_UNSUPPORTED_BITS_PER_SAMPLE;
+      if (isFloat && bits != 32 && bits != 64)
+        return RC::ERROR_UNSUPPORTED_BITS_PER_SAMPLE;
+      if (channels == 0 || rate == 0)
+        return RC::ERROR_INVALID_FILE;
+
+      const std::streamoff remaining = fileSize - static_cast<std::streamoff>(f.tellg());
+      uint64_t dataBytes = chunkSize;
+      if (dataBytes > static_cast<uint64_t>(std::max<std::streamoff>(remaining, 0)))
+        dataBytes = static_cast<uint64_t>(std::max<std::streamoff>(remaining, 0)); // truncated / streamed file
+      if (dataBytes > (static_cast<uint64_t>(256) << 20))
+        return RC::ERROR_INVALID_FILE; // 256 MB: certainly not an impulse response
+      std::vector<unsigned char> raw(static_cast<size_t>(dataBytes));
+      f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(dataBytes));
+
+      const size_t bytesPerSample = bits / 8;
+      const size_t frameBytes = bytesPerSample * channels;
+      const size_t frames = raw.size() / frameBytes;
+      if (frames == 0)
+        return RC::ERROR_INVALID_FILE;
+      audio.assign(frames, 0.0f);
+      for (size_t i = 0; i < frames; i++)
+      {
+        double sum = 0.0;
+        for (unsigned c = 0; c < channels; c++)
+        {
+          const unsigned char* p = &raw[i * frameBytes + c * bytesPerSample];
+          double v = 0.0;
+          if (isFloat && bits == 32)
+          {
+            float x;
+            std::memcpy(&x, p, 4);
+            v = x;
+          }
+          else if (isFloat)
+          {
+            double x;
+            std::memcpy(&x, p, 8);
+            v = x;
+          }
+          else if (bits == 8)
+            v = (static_cast<int>(p[0]) - 128) / 128.0;
+          else if (bits == 16)
+            v = static_cast<int16_t>(p[0] | (p[1] << 8)) / 32768.0;
+          else if (bits == 24)
+          {
+            int32_t x = p[0] | (p[1] << 8) | (p[2] << 16);
+            if (x & 0x800000)
+              x -= 0x1000000;
+            v = x / 8388608.0;
+          }
+          else
+          {
+            const int32_t x = static_cast<int32_t>(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                                                   | (static_cast<uint32_t>(p[2]) << 16)
+                                                   | (static_cast<uint32_t>(p[3]) << 24));
+            v = x / 2147483648.0;
+          }
+          sum += v;
+        }
+        audio[i] = static_cast<float>(sum / channels);
+      }
+      sampleRate = static_cast<double>(rate);
+      return RC::SUCCESS;
+    }
+    else
+    {
+      // Any other chunk: skip it (chunks are padded to an even size)
+      f.ignore(static_cast<std::streamsize>(chunkSize) + (chunkSize & 1));
+      if (!f)
+        break;
+    }
+  }
+  return RC::ERROR_INVALID_FILE; // no usable data chunk
+}
+
 class LongImpulseResponse
 {
 public:
@@ -272,7 +434,7 @@ public:
   : mWavState(dsp::wav::LoadReturnCode::ERROR_OTHER)
   , mSampleRate(sampleRate)
   {
-    mWavState = dsp::wav::Load(fileName, mRawAudio, mRawAudioSampleRate);
+    mWavState = LoadWavTolerant(fileName, mRawAudio, mRawAudioSampleRate);
     if (mWavState == dsp::wav::LoadReturnCode::SUCCESS)
       _Build();
   }
