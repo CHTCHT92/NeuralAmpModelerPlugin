@@ -1478,4 +1478,260 @@ void NeuralAmpModeler::_IRWorkerLoop()
   }
 }
 
-std::string NeuralAmpModeler::_StageIRInBackground(const std::filesystem
+std::string NeuralAmpModeler::_StageIRInBackground(const std::filesystem::path& path)
+{
+  try
+  {
+    std::unique_ptr<LongImpulseResponse> temp = std::make_unique<LongImpulseResponse>(path.string().c_str(), GetSampleRate());
+    const dsp::wav::LoadReturnCode wavState = temp->GetWavState();
+    if (wavState != dsp::wav::LoadReturnCode::SUCCESS)
+      return dsp::wav::GetMsgForLoadReturnCode(wavState);
+    mStagedIR = std::move(temp);
+    {
+      std::lock_guard<std::mutex> lock(mIRListMutex);
+      mIRPath.Set(path.string().c_str());
+    }
+    mIRPathNeedsUIRefresh = true;
+  }
+  catch (std::exception& e)
+  {
+    return e.what();
+  }
+  return "";
+}
+
+dsp::wav::LoadReturnCode NeuralAmpModeler::_StageIR(const WDL_String& irPath)
+{
+  WDL_String previousIRPath = mIRPath;
+  const double sampleRate = GetSampleRate();
+  dsp::wav::LoadReturnCode wavState = dsp::wav::LoadReturnCode::ERROR_OTHER;
+  try
+  {
+    mStagedIR = std::make_unique<LongImpulseResponse>(irPath.Get(), sampleRate);
+    wavState = mStagedIR->GetWavState();
+  }
+  catch (std::runtime_error& e)
+  {
+    wavState = dsp::wav::LoadReturnCode::ERROR_OTHER;
+    std::cerr << "Caught unhandled exception while attempting to load IR:" << std::endl;
+    std::cerr << e.what() << std::endl;
+  }
+
+  if (wavState == dsp::wav::LoadReturnCode::SUCCESS)
+  {
+    mIRPath = irPath;
+    SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, mIRPath.GetLength(), mIRPath.Get());
+  }
+  else
+  {
+    if (mStagedIR != nullptr)
+    {
+      mStagedIR = nullptr;
+    }
+    mIRPath = previousIRPath;
+    SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadFailed);
+  }
+
+  return wavState;
+}
+
+size_t NeuralAmpModeler::_GetBufferNumChannels() const
+{
+  return mInputArray.size();
+}
+
+size_t NeuralAmpModeler::_GetBufferNumFrames() const
+{
+  if (_GetBufferNumChannels() == 0)
+    return 0;
+  return mInputArray[0].size();
+}
+
+void NeuralAmpModeler::_InitToneStack()
+{
+  mToneStack = std::make_unique<dsp::tone_stack::BasicNamToneStack>();
+}
+
+void NeuralAmpModeler::_PrepareBuffers(const size_t numChannels, const size_t numFrames)
+{
+  const bool updateChannels = numChannels != _GetBufferNumChannels();
+  const bool updateFrames = updateChannels || (_GetBufferNumFrames() != numFrames);
+
+  if (updateChannels)
+  {
+    _PrepareIOPointers(numChannels);
+    mInputArray.resize(numChannels);
+    mOutputArray.resize(numChannels);
+    // ===== NOUVEAUX BUFFERS =====
+    mDriveArray.resize(numChannels);
+    mStereoArray.resize(2);
+    mDelayArray.resize(2);
+    mReverbArray.resize(2);
+
+    delete[] mDrivePointers;
+    mDrivePointers = new iplug::sample*[numChannels];
+    delete[] mStereoPointers;
+    mStereoPointers = new iplug::sample*[2];
+    delete[] mDelayPointers;
+    mDelayPointers = new iplug::sample*[2];
+    delete[] mReverbPointers;
+    mReverbPointers = new iplug::sample*[2];
+    // ===========================
+  }
+  if (updateFrames)
+  {
+    for (auto c = 0; c < mInputArray.size(); c++)
+    {
+      mInputArray[c].resize(numFrames);
+      std::fill(mInputArray[c].begin(), mInputArray[c].end(), 0.0);
+    }
+    for (auto c = 0; c < mOutputArray.size(); c++)
+    {
+      mOutputArray[c].resize(numFrames);
+      std::fill(mOutputArray[c].begin(), mOutputArray[c].end(), 0.0);
+    }
+    // ===== NOUVEAUX BUFFERS =====
+    for (auto c = 0; c < mDriveArray.size(); c++)
+      mDriveArray[c].resize(numFrames);
+    for (auto c = 0; c < mStereoArray.size(); c++)
+      mStereoArray[c].resize(numFrames);
+    for (auto c = 0; c < mDelayArray.size(); c++)
+      mDelayArray[c].resize(numFrames);
+    for (auto c = 0; c < mReverbArray.size(); c++)
+      mReverbArray[c].resize(numFrames);
+    // ===========================
+  }
+  for (auto c = 0; c < mInputArray.size(); c++)
+    mInputPointers[c] = mInputArray[c].data();
+  for (auto c = 0; c < mOutputArray.size(); c++)
+    mOutputPointers[c] = mOutputArray[c].data();
+  // ===== NOUVEAUX BUFFERS =====
+  for (auto c = 0; c < mDriveArray.size(); c++)
+    mDrivePointers[c] = mDriveArray[c].data();
+  for (auto c = 0; c < mStereoArray.size(); c++)
+    mStereoPointers[c] = mStereoArray[c].data();
+  for (auto c = 0; c < mDelayArray.size(); c++)
+    mDelayPointers[c] = mDelayArray[c].data();
+  for (auto c = 0; c < mReverbArray.size(); c++)
+    mReverbPointers[c] = mReverbArray[c].data();
+  // ===========================
+}
+
+void NeuralAmpModeler::_PrepareIOPointers(const size_t numChannels)
+{
+  _DeallocateIOPointers();
+  _AllocateIOPointers(numChannels);
+}
+
+void NeuralAmpModeler::_ProcessInput(iplug::sample** inputs, const size_t nFrames, const size_t nChansIn,
+                                     const size_t nChansOut)
+{
+  if (nChansOut != 1)
+  {
+    std::stringstream ss;
+    ss << "Expected mono output, but " << nChansOut << " output channels are requested!";
+    throw std::runtime_error(ss.str());
+  }
+
+  double gain = mInputGain;
+#ifndef APP_API
+  gain /= (float)nChansIn;
+#endif
+  for (size_t c = 0; c < nChansIn; c++)
+    for (size_t s = 0; s < nFrames; s++)
+      if (c == 0)
+        mInputArray[0][s] = gain * inputs[c][s];
+      else
+        mInputArray[0][s] += gain * inputs[c][s];
+}
+
+void NeuralAmpModeler::_ProcessOutput(iplug::sample** inputs, iplug::sample** outputs, const size_t nFrames,
+                                      const size_t nChansIn, const size_t nChansOut)
+{
+  const double gain = mOutputGain;
+
+  if (nChansIn == 1)
+  {
+    // Broadcast mono vers tous les canaux externes
+    for (auto cout = 0; cout < nChansOut; cout++)
+      for (auto s = 0; s < nFrames; s++)
+#ifdef APP_API
+        outputs[cout][s] = std::clamp(gain * inputs[0][s], -1.0, 1.0);
+#else
+        outputs[cout][s] = gain * inputs[0][s];
+#endif
+  }
+  else if (nChansIn == 2)
+  {
+    // Stéréo : chaque canal externe prend L ou R (alternance si > 2)
+    for (auto cout = 0; cout < nChansOut; cout++)
+    {
+      const size_t cin = cout % 2;
+      for (auto s = 0; s < nFrames; s++)
+#ifdef APP_API
+        outputs[cout][s] = std::clamp(gain * inputs[cin][s], -1.0, 1.0);
+#else
+        outputs[cout][s] = gain * inputs[cin][s];
+#endif
+    }
+  }
+}
+
+void NeuralAmpModeler::_UpdateControlsFromModel()
+{
+  if (mModel == nullptr)
+  {
+    return;
+  }
+  if (auto* pGraphics = GetUI())
+  {
+    ModelInfo modelInfo;
+    modelInfo.sampleRate.known = true;
+    modelInfo.sampleRate.value = mModel->GetEncapsulatedSampleRate();
+    modelInfo.inputCalibrationLevel.known = mModel->HasInputLevel();
+    modelInfo.inputCalibrationLevel.value = mModel->HasInputLevel() ? mModel->GetInputLevel() : 0.0;
+    modelInfo.outputCalibrationLevel.known = mModel->HasOutputLevel();
+    modelInfo.outputCalibrationLevel.value = mModel->HasOutputLevel() ? mModel->GetOutputLevel() : 0.0;
+
+    static_cast<NAMSettingsPageControl*>(pGraphics->GetControlWithTag(kCtrlTagSettingsBox))->SetModelInfo(modelInfo);
+
+    const bool disableInputCalibrationControls = !mModel->HasInputLevel();
+    pGraphics->GetControlWithTag(kCtrlTagCalibrateInput)->SetDisabled(disableInputCalibrationControls);
+    pGraphics->GetControlWithTag(kCtrlTagInputCalibrationLevel)->SetDisabled(disableInputCalibrationControls);
+    {
+      auto* c = static_cast<OutputModeControl*>(pGraphics->GetControlWithTag(kCtrlTagOutputMode));
+      c->SetNormalizedDisable(!mModel->HasLoudness());
+      c->SetCalibratedDisable(!mModel->HasOutputLevel());
+    }
+
+    if (auto* pSlimIcon = pGraphics->GetControlWithTag(kCtrlTagSlimmableIcon))
+    {
+      const bool show = mModel->GetSlimmableModel() != nullptr;
+      pSlimIcon->Hide(!show);
+    }
+  }
+}
+
+void NeuralAmpModeler::_UpdateLatency()
+{
+  int latency = 0;
+  if (mModel)
+  {
+    latency += mModel->GetLatency();
+  }
+  if (GetLatency() != latency)
+  {
+    SetLatency(latency);
+  }
+}
+
+void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPointer, const size_t nFrames,
+                                     const size_t nChansIn, const size_t nChansOut)
+{
+  const int nChansHack = 1;
+  mInputSender.ProcessBlock(inputPointer, (int)nFrames, kCtrlTagInputMeter, nChansHack);
+  mOutputSender.ProcessBlock(outputPointer, (int)nFrames, kCtrlTagOutputMeter, nChansHack);
+}
+
+// HACK
+#include "Unserialization.cpp"
