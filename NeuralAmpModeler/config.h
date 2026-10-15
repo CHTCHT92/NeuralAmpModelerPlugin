@@ -27,8 +27,8 @@
 #define PLUG_DOES_MPE 0
 #define PLUG_DOES_STATE_CHUNKS 0
 #define PLUG_HAS_UI 1
-#define PLUG_WIDTH 600
-#define PLUG_HEIGHT 400
+#define PLUG_WIDTH 700
+#define PLUG_HEIGHT 620
 #define PLUG_FPS 60
 #define PLUG_SHARED_RESOURCES 0
 #define PLUG_HOST_RESIZE 0
@@ -94,9 +94,6 @@
 #define METERBACKGROUND3X_FN "MeterBackground@3x.png"
 
 // Issue 291
-// On the macOS standalone, we might not have permissions to traverse the file directory, so we have the app ask the
-// user to pick a directory instead of the file in the directory.
-// Everyone else is fine though.
 #if defined(APP_API) && defined(__APPLE__)
   #define NAM_PICK_DIRECTORY
 #endif
