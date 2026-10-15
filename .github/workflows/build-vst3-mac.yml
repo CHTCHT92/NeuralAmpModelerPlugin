@@ -44,7 +44,7 @@ jobs:
       - name: Build macOS
         run: |
           cd ${{ env.PROJECT_NAME }}/scripts
-          ./makedist-mac.sh full zip
+          ./makedist-mac.sh VST3 zip
         shell: bash
 
       - name: Upload artifact
